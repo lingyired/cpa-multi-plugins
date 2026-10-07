@@ -63,6 +63,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .summary-hd{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .summary-title{font-weight:700;font-size:14px}
 .summary-meta{color:var(--mut);font-size:12px}
+.summary-note{color:var(--mut);font-size:11px;line-height:1.5;margin-bottom:10px}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px}
 .summary-item{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
 .summary-item .k{color:var(--mut);font-size:11px;margin-bottom:4px}
@@ -749,8 +750,9 @@ function renderSummary(accounts){
       <div class="summary-title">账号汇总 · ${esc(providerName)}</div>
       <div class="summary-meta">${all.length} 个账号 · 有积分 ${knownN} · 已签到 ${checkedN} · 冷却 ${coolingN} · 禁用 ${disabledN} · 耗尽 ${exhaustedN}</div>
     </div>
+    <div class="summary-note">本面板只统计 ${esc(providerName)} 自己的账号：同一平台内的账号互相竞争排序（最早到期的包先烧）；不同平台的积分不相加、也不比较到期日。</div>
     <div class="summary-grid">
-      <div class="summary-item"><div class="k">总剩余积分</div><div class="v ok" title="套餐剩余 + 积分池（真实可花），签到奖励数额不计入">${unl?"不限":remain}</div></div>
+      <div class="summary-item"><div class="k">总剩余积分</div><div class="v ok" title="${esc(providerName)} 平台内各账号的套餐剩余 + 积分池（真实可花），签到奖励数额不计入；不含其他平台的积分">${unl?"不限":remain}</div></div>
       <div class="summary-item"><div class="k">待领奖励</div><div class="v ${bonusTotal?"warn":""}" title="今日未签账号的签到奖励数额（非可花余额），签到成功后入池">${bonusTotal}</div></div>
       <div class="summary-item"><div class="k">账号数</div><div class="v">${all.length}</div></div>
       <div class="summary-item"><div class="k">今日已签</div><div class="v ok">${checkedN}</div></div>

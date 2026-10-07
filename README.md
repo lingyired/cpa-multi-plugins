@@ -16,13 +16,15 @@
 
 ## 插件清单
 
-| 插件 | 平台 | 协议 | 签到 | 配额 | 状态 |
+| 插件 | 平台 | 协议 | 签到 | 配额（仅本平台账号内合并） | 状态 |
 |---|---|---|---|---|---|
 | `workbuddy` | CodeBuddy / WorkBuddy 三区合并（CN + Global + Intl） | OpenAI 兼容 | ✅ 每日 | ✅ credits | ✅ functional |
 | `trae` | Trae 三变体合并（Code CN + SOLO CN + Intl） | llm_utils_chat / Web SOLO | ✅ 每日 | ✅ v2 pack 优先级 | ✅ functional |
 | `qoder` | Qoder 双区合并（CN + Intl） | COSY 签名 | ✅ 每日 | ✅ quota | ✅ functional |
 | `zcode` | 智谱 GLM 编码套餐双 provider 合并（Z.AI + BigModel） | OpenAI 兼容 + anthropic 翻译 + 签名 V4 + off-peak 票务 | —（claim 需验证码侧车） | ✅ billing/balance | ✅ functional |
 | `mimo` | Xiaomi MiMo 双通道（platform OAuth sk + 桌面 SSO Cookie 收养） | OpenAI 兼容（sk lane 逐字对齐官方 CLI / cookie lane 逐字对齐桌面引擎 lane） | —（协议无签到面） | —（上游无配额端点） | ✅ functional |
+
+> 表头里的「合并」只指插件与家族变体的合并。**积分包不跨平台合并**：每个插件只统计并排序自己平台的账号，`trae` 的账号之间、`workbuddy` 的账号之间各自竞争，跨平台不相加也不比较到期日（见下文「为什么是 4 个独立插件而不是合并？」）。
 
 
 ## 功能对标
@@ -41,6 +43,7 @@
 
 ### ✅ 多账号 pool
 - credit-aware scheduler（积分降序挑选）
+- **平台内合并、平台间不合并**：同一 provider key 下的多个账号互相竞争排序（最早到期的包先烧），不同平台（`workbuddy` ↔ `trae`）的积分各算各的，既不相加也不互相比较到期日
 - 4 档 cooldown 状态机：
   - `CoolPlan` 12h（1005 plan 权益不足）
   - `CoolSoft` 60s（429/404 软限流）
@@ -78,6 +81,9 @@
 ## 为什么是 4 个独立插件而不是合并？
 
 CPA 的插件架构基于 `auth.identifier` + `executor.identifier`——**每个 `.so` 只能注册一个 provider name**。CPA 的 `HasAuthProvider(provider)` 按 identifier 精确匹配，所以合并家族后统一使用单一 provider key（`workbuddy` / `qoder` / `trae` / `zcode`），区域内差异（CN/Intl/SOLO 等）通过账号文件内的字段路由，旧插件名的账号文件启动时自动收养。
+
+> **注意：这里的「合并」指插件与家族变体的合并（同一个 provider key 下的 CN/SOLO/Intl），不是积分包的合并。**
+> 积分包的规则正好相反：**平台之间不合并，平台内不同账号可以合并**。同一个平台（如 `trae`）的多个账号互相竞争排序，最早到期的包先烧；不同平台（`trae` ↔ `workbuddy`）的积分既不相加，也不互相比较到期日。排序与展示由 `cpa-expiry-router` + 采集器负责，本仓库的插件只负责各自平台的账号与计费数据。
 
 ### 如果你想减少插件数量
 

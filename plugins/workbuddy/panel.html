@@ -71,6 +71,7 @@ button.sec{background:var(--btn-sec);color:var(--fg)}button.sec:hover{background
 .summary-hd{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .summary-title{font-weight:700;font-size:14px}
 .summary-meta{color:var(--mut);font-size:12px}
+.summary-note{color:var(--mut);font-size:11px;line-height:1.5;margin-bottom:10px}
 .summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px}
 /* 内嵌指标格：与账号卡内部表面一致（--surface），不用更深的 surface-muted */
 .summary-item{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:10px 12px}
@@ -695,6 +696,7 @@ function renderSummary(accounts){
       <div class="summary-title">用量汇总 · ${esc(scopeLabel)}</div>
       <div class="summary-meta">${scoped.length} 个账号 · 有数据 ${knownN} · 禁用 ${disabledN} · 耗尽 ${exhaustedN}</div>
     </div>
+    <div class="summary-note">本面板的池只含 workbuddy 自己的账号（CN/Global/Intl 同属一个平台，账号之间互相竞争排序）；不含其他平台（如 trae）的积分，跨平台既不相加也不比较到期日。</div>
     <div class="summary-grid">
       <div class="summary-item"><div class="k">剩余(可用)</div><div class="v ok">${remain}</div></div>
       <div class="summary-item"><div class="k">已用(消耗)</div><div class="v ${pct>85?"err":(pct>60?"warn":"")}">${used}</div></div>
@@ -709,7 +711,7 @@ function renderSummary(accounts){
     ${currentFilter==="all"?`
     <div class="pb-meta" style="margin-top:10px">分区域：CN 可用 ${cnRemain} / 已用 ${cnUsed} · Global 可用 ${glRemain} / 已用 ${glUsed}</div>
     `:`
-    <div class="pb-meta" style="margin-top:10px">全部账号池：可用 ${allRemain} · 已用 ${allUsed} · 池 ${allTotal||0}</div>
+    <div class="pb-meta" style="margin-top:10px">全部账号池（仅 workbuddy）：可用 ${allRemain} · 已用 ${allUsed} · 池 ${allTotal||0}</div>
     `}
   `;
 }
