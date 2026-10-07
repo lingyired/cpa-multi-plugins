@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.9.36
+
+### A stop with no answer and no tool call is a failure, not a completion
+
+The DeepSeek model behind WorkBuddy emits its tool call as DSML text. When the
+gateway's extractor loses that call, only the closing tags survive - inside
+reasoning_content - and the stream still terminates with
+finish_reason: "stop". The client then reported a completed turn containing no
+answer and no tool call, so the agent stopped mid-task and the owner had to
+reply to resume it. Measured 2026-10-07 over this machine's sessions: 23 of the
+25 assistant messages whose reasoning text leaked DSML ended a turn that way,
+all of them on the cliproxyapi / deepseek-v4.1-flash route.
+
+- **Degraded-completion guard (stream.go)**: completionCoverage folds every
+  upstream chunk and flags a stop that carried neither non-empty content nor a
+  tool call. The async pump (pumpStreamFrames), the synchronous collector
+  (aggregateSSEWithCollector) and the non-stream fold (aggregateCompletion) all
+  refuse such a completion instead of forwarding the terminal chunk, so the
+  client sees a failed step it can retry rather than a finished turn.
+  finish_reason "length" stays a normal completion: it already tells the client
+  the output budget ran out.
+- **Error wording (policy.go)**: degradedCompletionError keeps the
+  "unexpected EOF" phrasing, so CPA classifies the failure as a connection
+  lifecycle event (conductor_cooldown.go isConnectionLifecycleMessage) and a
+  healthy credential is not cooled for a model-output defect.
+- **Tests (degraded_completion_test.go)**: pin all three read paths plus the
+  classification-bearing wording; answered, tool-calling and length streams
+  still pass through untouched.
+
 ## 0.9.35
 
 ### The catalog is identity-split — global/intl discovery unions both client rosters

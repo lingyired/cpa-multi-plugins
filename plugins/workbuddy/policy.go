@@ -169,6 +169,21 @@ func upstreamReadError(err error) error {
 	return fmt.Errorf("upstream stream read error (unexpected EOF): %w", err)
 }
 
+// degradedCompletionError renders a completion that ended with finish_reason
+// "stop" while carrying neither an answer nor a tool call: the model's tool
+// call was lost upstream (its DSML closing tags leak into reasoning_content)
+// and only the reasoning survived. Forwarding it as a normal completion makes
+// every client report a finished turn for work that never happened.
+//
+// The wording is load-bearing for the same reason emptyStreamError's is: the
+// "unexpected EOF" phrasing makes CPA classify the failure as a connection
+// lifecycle event (conductor_cooldown.go isConnectionLifecycleMessage), so a
+// healthy credential keeps its status instead of being cooled for a
+// model-output defect. "degraded_completion" is the plugin-side key.
+func degradedCompletionError() error {
+	return fmt.Errorf("degraded_completion: workbuddy upstream ended with reasoning only and neither an answer nor a tool call (unexpected EOF)")
+}
+
 // notePrefix renders the region/disabled head of an auth-card note, without
 // the credit segment. Kept separate so syncAuthNote can rebuild a note while
 // preserving a previously known credit segment.

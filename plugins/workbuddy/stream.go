@@ -289,6 +289,70 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 	invalidateAccountCredits(authID, authUID)
 }
 
+// completionCoverage records what an upstream completion actually delivered so
+// a terminal `stop` that produced neither an answer nor a tool call can be
+// reported instead of forwarded as a silent success.
+//
+// Why this exists: the DeepSeek model behind WorkBuddy emits its tool call in
+// DSML text. When the gateway's extractor loses that call, only the closing
+// tags survive — inside reasoning_content — and the stream still terminates
+// with finish_reason=stop (measured 2026-10-07: 23 of the 25 leaked-DSML turns
+// on this machine ended the client's turn with no answer and no tool call, so
+// the client showed "completed" and the owner had to reply to resume).
+// finish_reason `length` is deliberately NOT degraded: it already tells the
+// client its output budget ran out.
+type completionCoverage struct {
+	answered   bool
+	toolCalled bool
+	finish     string
+}
+
+// observe folds one raw upstream chunk payload (no "data: " prefix) into the
+// coverage. A payload that does not parse is ignored; coverage never fails a
+// stream on its own.
+func (c *completionCoverage) observe(raw []byte) {
+	var probe struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Delta        *struct {
+				Content      string            `json:"content"`
+				ToolCalls    []json.RawMessage `json:"tool_calls"`
+				FunctionCall json.RawMessage   `json:"function_call"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(raw, &probe) != nil {
+		return
+	}
+	for _, choice := range probe.Choices {
+		if delta := choice.Delta; delta != nil {
+			if delta.Content != "" {
+				c.answered = true
+			}
+			if len(delta.ToolCalls) > 0 || carriesCall(delta.FunctionCall) {
+				c.toolCalled = true
+			}
+		}
+		if choice.FinishReason != "" {
+			c.finish = choice.FinishReason
+		}
+	}
+}
+
+// degraded reports a completion that claims the model finished on purpose while
+// carrying nothing a client can act on.
+func (c *completionCoverage) degraded() bool {
+	return c.finish == "stop" && !c.answered && !c.toolCalled
+}
+
+// carriesCall reports whether a legacy function_call field holds a real call:
+// upstream pads terminal chunks with `"function_call":null` (the reason
+// cleanChunkJSON exists), so mere presence is not a signal.
+func carriesCall(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null" && trimmed != "{}"
+}
+
 // pumpStreamFrames runs the async pump's SSE read loop. With a nil gate it
 // mirrors the pre-feature pump exactly — every cleaned chunk is emitted the
 // moment it is read, error frames and read failures abort in-band. With the
@@ -309,6 +373,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 func pumpStreamFrames(scanner *bufio.Scanner, sink streamSink, gate *streamHeadGate, sseFramed bool, collector *sseUsageCollector, requestedModel, upstreamModel, authUID string, started time.Time, sa *storedAuth) (bool, bool) {
 	seenPayload := false
 	gating := gate != nil
+	coverage := &completionCoverage{}
 	var pending [][]byte
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -335,6 +400,25 @@ func pumpStreamFrames(scanner *bufio.Scanner, sink streamSink, gate *streamHeadG
 			continue
 		}
 		collector.feed(content)
+		coverage.observe([]byte(content))
+		// Degraded-completion guard: the model finished "cleanly" with neither
+		// an answer nor a tool call, so every client would report a completed
+		// turn for work that never happened. Fail instead of forwarding the
+		// terminal chunk; the client can then retry the step.
+		if coverage.degraded() {
+			message := degradedCompletionError().Error()
+			publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), true, 0, message)
+			if gating {
+				// Nothing reached the client yet: report it through the
+				// hand-off so it becomes a normal failed request instead of a
+				// 200 stream that ends with an in-band error.
+				if !gate.fail(degradedCompletionError()) {
+					return seenPayload, true
+				}
+			}
+			sink.emitError(message)
+			return seenPayload, true
+		}
 		cleaned := cleanChunkJSON(content)
 		if cleaned == "" {
 			continue
@@ -448,6 +532,7 @@ func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageC
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var chunks []pluginapi.ExecutorStreamChunk
 	seenPayload := false
+	coverage := &completionCoverage{}
 	for scanner.Scan() {
 		content, meaningful, frameErr := workBuddyStreamFrame(scanner.Text())
 		if frameErr != nil {
@@ -460,6 +545,7 @@ func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageC
 		if collector != nil {
 			collector.feed(content)
 		}
+		coverage.observe([]byte(content))
 		cleaned := cleanChunkJSON(content)
 		if cleaned == "" {
 			continue
@@ -474,6 +560,11 @@ func aggregateSSEWithCollector(r io.Reader, sseFramed bool, collector *sseUsageC
 	}
 	if !seenPayload {
 		return chunks, emptyStreamError()
+	}
+	// Nothing has been handed to the client yet on this path, so the degraded
+	// completion can still become a plain failed request.
+	if coverage.degraded() {
+		return chunks, degradedCompletionError()
 	}
 	return chunks, nil
 }
@@ -666,6 +757,12 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 		if len(calls) > 0 {
 			message["tool_calls"] = calls
 		}
+	}
+	// Non-stream twin of the pump's degraded-completion guard: a completion
+	// that carries neither content nor a tool call is not an answer, whatever
+	// finish_reason says.
+	if content == "" && message["tool_calls"] == nil && firstNonEmpty(finish, "stop") == "stop" {
+		return nil, degradedCompletionError()
 	}
 	if created == 0 {
 		created = time.Now().Unix()
