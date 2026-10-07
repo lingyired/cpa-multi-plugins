@@ -504,6 +504,42 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// RawModelCatalog returns the untreated get_detail_param payload, every field
+// included. FetchModels reads only five of them and drops the rest, so the
+// per-model credit multiplier the Trae clients display ("积分消耗速率", e.g.
+// DeepSeek-V4.1 at 0.06x with an off-peak badge) never reaches a caller. This
+// method exists so the multiplier and its field name can be read from the real
+// response instead of guessed, and re-read whenever upstream changes it.
+//
+// @param a - the credential to query.
+// @returns the decoded response body.
+func (c *Client) RawModelCatalog(a *auth.Auth) (map[string]any, error) {
+	body := map[string]any{
+		"function":            FunctionFor(a.Variant),
+		"config_names":        nil,
+		"need_prompt":         false,
+		"current_config_info": nil,
+		"poly_prompt":         true,
+		"mode_type":           nil,
+		"agent_type":          nil,
+	}
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	SOLOHeaders(req, a, false)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return nil, err
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, fmt.Errorf("raw models parse: %w", err)
+	}
+	return out, nil
+}
+
 // CheckinStatus 查询签到状态。
 // v0.12.41: 对齐官方客户端契约（反编译 TraeCode CN 2.3.79946 deb 与 TraeWork
 // CN 2.3.81345 exe（装出 "TRAE SOLO CN"）两版 out/main.js 交叉实证）：

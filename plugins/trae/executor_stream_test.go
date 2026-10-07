@@ -84,7 +84,7 @@ func TestConvertSOLOStreamChunksAreBareJSON(t *testing.T) {
 		"event: token_usage\ndata: {\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}\n\n" +
 		"event: done\ndata: {\"finish_reason\":\"stop\"}\n\n"
 	var chunks [][]byte
-	for c := range convertSOLOStreamToOpenAI(strings.NewReader(body), "m1", nil) {
+	for c := range convertSOLOStreamToOpenAI(strings.NewReader(body), "m1", nil, nil) {
 		chunks = append(chunks, c)
 	}
 	if len(chunks) < 3 {

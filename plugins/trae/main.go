@@ -140,7 +140,7 @@ const (
 // version is injected at build time via -ldflags "-X main.version=...".
 // Keep the default in sync with the release tag: the shipped build.sh does
 // NOT inject it (only "-s -w"), so the plugin reports this literal value.
-var version = "0.12.61"
+var version = "0.12.84"
 
 var (
 	hostAPI *C.cliproxy_host_api
@@ -1931,8 +1931,17 @@ func handleExecExecute(request []byte) ([]byte, error) {
 	}
 	defer rc.Close()
 
-	completion, err := upstream.Aggregate(rc)
+	// v0.12.84: 排队观测。非流式路径同样会撞排队，没有观测点就只能看到
+	// "这个请求花了 90 秒"，看不到其中 85 秒在排队。
+	queue := newQueueWatcher(queueRequest{
+		UID:      a.UID,
+		Nickname: a.Nickname,
+		Variant:  a.Variant,
+		Model:    req.Model,
+	})
+	completion, err := upstream.AggregateWithObserver(rc, queue.Observe)
 	if err != nil {
+		queue.Finish(true)
 		if se, ok := err.(*upstream.SOLOStreamError); ok {
 			applyCooldown(a.UID, se.Kind())
 			// v0.12.83: 这里原来只把错误 `aggregate: %w` 一层包装就返回，状态被
@@ -1942,6 +1951,7 @@ func handleExecExecute(request []byte) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("aggregate: %w", err)
 	}
+	queue.Finish(false)
 	accountPool.NoteSuccess(a.UID)
 	out, _ := json.Marshal(completion)
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: out})
@@ -2156,24 +2166,42 @@ func handleExecStream(request []byte) ([]byte, error) {
 		applyCooldown(a.UID, se.Kind())
 	}
 
+	// v0.12.84: 排队观测。上游在出 token 之前下发 progress_notice /
+	// queue_begin / request_wait_in_queue（实测 position 560→550→546→537），
+	// 这些事件不产出 OpenAI chunk，以前在这里被整段丢掉。
+	queueModel := req.Model
+	if queueModel == "" {
+		queueModel = model
+	}
+	queue := newQueueWatcher(queueRequest{
+		UID:      a.UID,
+		Nickname: a.Nickname,
+		Variant:  a.Variant,
+		Model:    queueModel,
+	})
+
 	// Async path (c-shared plugins always get a stream_id): return
 	// immediately with empty chunks, then pump the SOLO→OpenAI SSE frames
 	// via host.stream.emit — same pattern as workbuddy pumpUpstreamStream.
 	// The pump goroutine owns rc (handleExecStream returns before the
 	// upstream is drained, so no defer Close here).
 	if req.StreamID != "" {
-		ch := convertSOLOStreamToOpenAI(rc, model, onSoloErr)
+		ch := convertSOLOStreamToOpenAI(rc, model, onSoloErr, queue.Observe)
 		// v0.12.83: 先确认这一路真的开始答话，再决定移不移交流。chunk 一旦到了
 		// 客户端，响应状态就定死了，1005/4008 这种账号级错误会被宿主当成
 		// "成功的空回答"。首包之前失败仍然可以当普通失败返回，带上宿主用于
 		// 冷却/换号的状态码。
 		head, se := soloStreamHead(ch, faults)
 		if se != nil {
+			queue.Finish(true)
 			rc.Close()
 			return nil, upstreamStatusError(soloFaultStatus(se), soloStreamErrorCopy(se))
 		}
 		go func() {
 			defer rc.Close()
+			// 排队记录必须在流真正收尾时结束：提前 Finish 会让快照显示
+			// "已结束"，而实际上还在排队。
+			defer func() { queue.Finish(faults.any()) }()
 			for _, chunk := range head {
 				if err := streamEmit(req.StreamID, chunk); err != nil {
 					return
@@ -2200,9 +2228,10 @@ func handleExecStream(request []byte) ([]byte, error) {
 
 	// Synchronous fallback (no stream id): collect everything, return once.
 	defer rc.Close()
-	ch := convertSOLOStreamToOpenAI(rc, model, onSoloErr)
+	ch := convertSOLOStreamToOpenAI(rc, model, onSoloErr, queue.Observe)
 	head, se := soloStreamHead(ch, faults)
 	if se != nil {
+		queue.Finish(true)
 		return nil, upstreamStatusError(soloFaultStatus(se), soloStreamErrorCopy(se))
 	}
 	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(head)+4)
@@ -2212,6 +2241,7 @@ func handleExecStream(request []byte) ([]byte, error) {
 	for chunk := range ch {
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: chunk})
 	}
+	queue.Finish(faults.any())
 	if !faults.any() {
 		accountPool.NoteSuccess(a.UID)
 	}

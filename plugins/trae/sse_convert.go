@@ -14,8 +14,12 @@ import (
 )
 
 // convertSOLOStreamToOpenAI reads SOLO SSE from r and emits OpenAI SSE chunks
-// to the returned channel. Each emitted []byte is "data: {...}\n\n".
-func convertSOLOStreamToOpenAI(r io.Reader, model string, onErr func(*upstream.SOLOStreamError)) <-chan []byte {
+// to the returned channel. Each emitted []byte is bare JSON (the host frames it).
+//
+// obs（可为 nil）会收到每一个解析成功的事件，用于排队观测：上游在出 token
+// 之前会下发 progress_notice / queue_begin / request_wait_in_queue，这些事件
+// 不产出任何 OpenAI chunk，此前在这里被 switch 静默丢弃。
+func convertSOLOStreamToOpenAI(r io.Reader, model string, onErr func(*upstream.SOLOStreamError), obs upstream.EventObserver) <-chan []byte {
 	ch := make(chan []byte, 32)
 	go func() {
 		defer close(ch)
@@ -51,6 +55,9 @@ func convertSOLOStreamToOpenAI(r io.Reader, model string, onErr func(*upstream.S
 			if line == "" && event != "" {
 				ev, parseErr := upstream.ParseSOLOLine(event, dataLine)
 				if parseErr == nil && ev != nil {
+					if obs != nil {
+						obs(ev)
+					}
 					switch ev.Event {
 					case "output":
 						delta := map[string]any{}

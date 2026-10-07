@@ -90,8 +90,11 @@ func managementRegistration() managementRegistrationResponse {
 			{Method: http.MethodGet, Path: base + "/accounts", Description: "List Trae SOLO CN accounts with credits, plan, and check-in status."},
 			{Method: http.MethodPost, Path: base + "/checkin", Description: "Manually check in one account (auth_index) or all accounts."},
 			{Method: http.MethodGet, Path: base + "/credits", Description: "Get real-time credits for one (auth_index query) or all accounts."},
+			{Method: http.MethodGet, Path: base + "/packs", Description: "Per-account entitlement packs: auth_id, name, end_time (Unix seconds), credits_limit, credits_amount, remain — the untreated user_entitlement_pack_list behind /credits."},
+			{Method: http.MethodGet, Path: base + "/catalog_raw", Description: "Untreated get_detail_param response per account, every field included (the per-model credit multiplier FetchModels drops)."},
 			{Method: http.MethodPost, Path: base + "/refresh", Description: "Force refresh access tokens for all accounts and return the refreshed dashboard (accounts)."},
 			{Method: http.MethodGet, Path: base + "/status", Description: "Account-pool state: cooling / disabled reasons per account."},
+			{Method: http.MethodGet, Path: base + "/queue", Description: "Live TRAE SOLO queue state: position + wait time for requests currently queued upstream (queue_begin / request_wait_in_queue), plus recent queue episodes."},
 			{Method: http.MethodPost, Path: base + "/import", Description: "Import Trae credential JSON (nested or flat) into host auth store."},
 			{Method: http.MethodGet, Path: base + "/intl/accounts", Description: "Trae Intl: list accounts with uid, nickname, and token expiry."},
 			{Method: http.MethodGet, Path: base + "/intl/status", Description: "Trae Intl: plugin status."},
@@ -153,10 +156,16 @@ func handleManagement(raw []byte) ([]byte, error) {
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleManualCheckin(req)))
 	case req.Method == http.MethodGet && path == base+"/credits":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCreditsQuery(req)))
+	case req.Method == http.MethodGet && path == base+"/packs":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handlePacksQuery(req)))
+	case req.Method == http.MethodGet && path == base+"/catalog_raw":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleCatalogRawQuery(req)))
 	case req.Method == http.MethodPost && path == base+"/refresh":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleRefresh()))
 	case req.Method == http.MethodGet && path == base+"/status":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, buildPoolStatus()))
+	case req.Method == http.MethodGet && path == base+"/queue":
+		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleQueueQuery()))
 	case req.Method == http.MethodPost && path == base+"/import":
 		return okEnvelope(mgmtJSONResponse(http.StatusOK, handleImportAuth(req)))
 	}
@@ -783,6 +792,152 @@ func cachePlan(authIndex string) (p string) {
 		}
 	}
 	return
+}
+
+// handleCatalogRawQuery returns the untreated model catalogue of one
+// (?auth_index=) or every account, keeping every field. FetchModels keeps five
+// of them; this route exists to read the rest — in particular the per-model
+// credit multiplier the Trae clients show as "积分消耗速率" — so a display name
+// can quote the real number instead of a guess.
+func handleCatalogRawQuery(req pluginapi.ManagementRequest) map[string]any {
+	authIndex := ""
+	if req.Query != nil {
+		authIndex = strings.TrimSpace(req.Query.Get("auth_index"))
+	}
+	results := []map[string]any{}
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if authIndex != "" && f.AuthIndex != authIndex {
+			continue
+		}
+		entry := map[string]any{"auth_index": f.AuthIndex, "auth_id": f.ID}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			entry["error"] = "load auth: " + err.Error()
+			results = append(results, entry)
+			continue
+		}
+		entry["uid"] = sa.Account.UID
+		entry["nickname"] = sa.Account.Nickname
+		entry["variant"] = sa.Variant
+		raw, err := upstreamClient.RawModelCatalog(hostAuthAsUpstream(sa))
+		if err != nil {
+			entry["error"] = "catalog: " + err.Error()
+			results = append(results, entry)
+			continue
+		}
+		if list, ok := raw["config_info_list"].([]any); ok {
+			entry["config_info_list"] = list
+		} else {
+			entry["raw"] = raw
+		}
+		results = append(results, entry)
+	}
+	return map[string]any{
+		"provider":    providerName,
+		"server_time": time.Now().Format("2006-01-02 15:04:05"),
+		"results":     results,
+	}
+}
+
+// handlePacksQuery returns the untreated entitlement-pack list of one
+// (?auth_index=) or every account. /credits folds the same upstream response
+// into aggregate numbers; this route exists because an external ranking
+// consumer needs each pack's own expiry (end_time) and remaining credits to
+// order accounts by what expires soonest.
+//
+// Entries whose upstream call fails carry "error" instead of "packs", so one
+// unreachable account never hides the others.
+func handlePacksQuery(req pluginapi.ManagementRequest) map[string]any {
+	authIndex := ""
+	if req.Query != nil {
+		authIndex = strings.TrimSpace(req.Query.Get("auth_index"))
+	}
+	if authIndex == "" && len(req.Body) > 0 {
+		var body struct {
+			AuthIndex string `json:"auth_index"`
+		}
+		_ = json.Unmarshal(req.Body, &body)
+		authIndex = body.AuthIndex
+	}
+	results := []map[string]any{}
+
+	files, err := hostAuthList()
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	for _, f := range files {
+		if authIndex != "" && f.AuthIndex != authIndex {
+			continue
+		}
+		entry := map[string]any{"auth_index": f.AuthIndex, "auth_id": f.ID, "uid": "", "nickname": ""}
+		sa, err := hostAuthGet(f.AuthIndex)
+		if err != nil {
+			entry["error"] = "load auth: " + err.Error()
+			results = append(results, entry)
+			continue
+		}
+		entry["uid"] = sa.Account.UID
+		entry["nickname"] = sa.Account.Nickname
+		a := hostAuthAsUpstream(sa)
+		usage, err := upstreamClient.UserEntUsage(a)
+		if err != nil {
+			entry["error"] = "ent_usage: " + err.Error()
+			results = append(results, entry)
+			continue
+		}
+		packs := make([]map[string]any, 0, len(usage.UserEntitlementPackList))
+		for i := range usage.UserEntitlementPackList {
+			pack := &usage.UserEntitlementPackList[i]
+			info := pack.EntitlementBaseInfo
+			quota := pack.EffectiveQuota()
+			item := map[string]any{
+				"name":               strings.TrimSpace(pack.DisplayDesc),
+				"end_time":           info.EndTime, // upstream Unix SECONDS; 0 = none published
+				"product_type":       info.ProductType,
+				"is_hide":            info.IsHide,
+				"credits_limit":      quota.CreditsLimit,
+				"basic_usage_limit":  quota.BasicUsageLimit,
+				"bonus_usage_limit":  quota.BonusUsageLimit,
+				"credits_amount":     pack.Usage.CreditsAmount,
+				"basic_usage_amount": pack.Usage.BasicUsageAmount,
+				"bonus_usage_amount": pack.Usage.BonusUsageAmount,
+			}
+			if info.Status != nil {
+				item["status"] = *info.Status
+			}
+			// Prefer the pack's own remain. CN free/check-in packs publish none
+			// through PackRemain, so fall back to credit limit minus usage —
+			// the same arithmetic the official cashier applies. An absent
+			// credits_amount means the pack is untouched, not unmeasurable:
+			// dropping those packs would hide most of a free account's balance.
+			if remain, known := pack.PackRemain(); known {
+				item["remain"] = remain
+			} else if quota.CreditsLimit != nil {
+				used := int64(0)
+				if pack.Usage.CreditsAmount != nil {
+					used = int64(*pack.Usage.CreditsAmount)
+				}
+				remain := *quota.CreditsLimit - used
+				if remain < 0 {
+					remain = 0
+				}
+				item["remain"] = remain
+			}
+			packs = append(packs, item)
+		}
+		entry["is_credits_billing"] = usage.IsCreditsBilling
+		entry["packs"] = packs
+		results = append(results, entry)
+	}
+	return map[string]any{
+		"provider":    providerName,
+		"server_time": time.Now().Format("2006-01-02 15:04:05"),
+		"results":     results,
+	}
 }
 
 // handleCreditsQuery fetches live credits from upstream for one (auth_index)

@@ -26,7 +26,7 @@ func runHead(t *testing.T, sse string) ([][]byte, *upstream.SOLOStreamError, *so
 	faults := &soloFaultTracker{}
 	ch := convertSOLOStreamToOpenAI(strings.NewReader(sse), "glm-5.2", func(se *upstream.SOLOStreamError) {
 		faults.record(se)
-	})
+	}, nil)
 	head, se := soloStreamHead(ch, faults)
 	return head, se, faults
 }

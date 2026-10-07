@@ -35,7 +35,7 @@ import (
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
-	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error
+	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error | queue_begin | request_wait_in_queue | progress_notice
 	Response     string          // output: content 增量
 	Reasoning    string          // output: 思考链增量
 	ToolCalls    json.RawMessage // output: 工具调用（null 或对象/数组）
@@ -43,6 +43,39 @@ type SOLOEvent struct {
 	FinishReason string          // done
 	ErrorCode    int64           // error
 	ErrorMessage string          // error
+
+	// v0.12.84 排队观测。上游在真正出 token 之前会持续下发这三类事件
+	// （2026-09-29 实测 soloprobe，CN 账号 + deepseek-v4.1-flash）：
+	//
+	//	event:progress_notice        data:"Processing_1790673459"   ← 裸 JSON 字符串
+	//	event:queue_begin            data:{"queue_id":"..","queue_type":1,"is_async":false,"request_uuid":".."}
+	//	event:request_wait_in_queue  data:{"position":560,"message":"Too many current requests. Your queue position is 560. Please wait for a while.","queue_id":"..","request_uuid":".."}
+	//
+	// request_wait_in_queue 约每秒一条，position 从大到小递减（实测 560→550→546→537）。
+	// 此前这些事件在 Stream/Aggregate/convertSOLOStreamToOpenAI 里被静默丢弃，
+	// 调用方只表现为"卡住不动"，没有任何排队提示。
+	Notice      string // progress_notice: 裸字符串内容（"Processing_<unix>" / ";Processing"）
+	QueueID     string // queue_begin / request_wait_in_queue: 本次排队的队列票据
+	QueueType   int64  // queue_begin: 队列类型（1..6，见客户端 QueueType 枚举）
+	IsAsync     bool   // queue_begin / request_wait_in_queue: 上游是否异步处理
+	RequestUUID string // 本次请求身份，用于把同一请求的排队段串起来
+	Position    int64  // request_wait_in_queue: 当前排队位次
+	HasPosition bool   // request_wait_in_queue: position 字段存在（0 也是合法位次）
+	Message     string // request_wait_in_queue: 上游原文提示
+}
+
+// EventObserver 接收每个解析成功的事件，由调用方决定关心哪些（排队观测关心
+// queue_begin / request_wait_in_queue / progress_notice 以及首个 output）。
+// 可为 nil。回调在读取流的 goroutine 上同步执行，必须是非阻塞的。
+type EventObserver func(*SOLOEvent)
+
+// IsQueueEvent 报告事件是否属于排队观测关心的三类。
+func (e *SOLOEvent) IsQueueEvent() bool {
+	switch e.Event {
+	case "queue_begin", "request_wait_in_queue", "progress_notice":
+		return true
+	}
+	return false
 }
 
 // SOLOStreamError 上游 SSE 流内的业务错误（event:error）。非流式聚合时返回，
@@ -104,6 +137,14 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	}
 	var raw map[string]any
 	if err := json.Unmarshal([]byte(dataLine), &raw); err != nil {
+		// progress_notice 的 data 是裸 JSON 字符串（"Processing_1790673459"），
+		// 不是对象。解析失败时退化为字符串而不是丢掉整行——否则排队期的心跳
+		// 完全不可观测。其他事件的字符串 data 同样走这条路。
+		var s string
+		if serr := json.Unmarshal([]byte(dataLine), &s); serr == nil {
+			ev.Notice = s
+			return ev, nil
+		}
 		return nil, err
 	}
 	switch ev.Event {
@@ -129,6 +170,26 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 		}
 		if v, ok := raw["message"].(string); ok {
 			ev.ErrorMessage = v
+		}
+	case "queue_begin", "request_wait_in_queue":
+		if v, ok := raw["queue_id"].(string); ok {
+			ev.QueueID = v
+		}
+		if v, ok := raw["request_uuid"].(string); ok {
+			ev.RequestUUID = v
+		}
+		if v, ok := raw["queue_type"].(float64); ok {
+			ev.QueueType = int64(v)
+		}
+		if v, ok := raw["is_async"].(bool); ok {
+			ev.IsAsync = v
+		}
+		if v, ok := raw["position"].(float64); ok {
+			ev.Position = int64(v)
+			ev.HasPosition = true
+		}
+		if v, ok := raw["message"].(string); ok {
+			ev.Message = v
 		}
 	}
 	return ev, nil
@@ -173,6 +234,17 @@ func scanLine(st *sseState, line string) *SOLOEvent {
 // Aggregate 读取完整 SOLO SSE，聚合 response + reasoning + tool_calls + usage，
 // 产出单个 OpenAI chat.completion（非流式）。
 func Aggregate(r io.Reader) (map[string]any, error) {
+	return aggregateWith(r, nil)
+}
+
+// AggregateWithObserver 同 Aggregate，额外把每个事件交给 obs（可为 nil）。
+// 非流式路径也需要它：上游的排队事件在聚合模式下同样会出现，没有观测点就
+// 只能看到"这个请求花了 90 秒"，看不到其中 85 秒在排队。
+func AggregateWithObserver(r io.Reader, obs EventObserver) (map[string]any, error) {
+	return aggregateWith(r, obs)
+}
+
+func aggregateWith(r io.Reader, obs EventObserver) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id           string
@@ -191,6 +263,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			return nil, err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
+			if obs != nil {
+				obs(ev)
+			}
 			switch ev.Event {
 			case "metadata":
 				if id == "" && ev.Usage != nil {
@@ -346,8 +421,17 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamE
 	return streamOpts(w, r, onErr)
 }
 
+// StreamWithObserver 同 StreamWithError，额外把每个事件交给 obs（可为 nil）。
+func StreamWithObserver(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), obs EventObserver) error {
+	return streamOptsObs(w, r, onErr, obs)
+}
+
 // streamOpts Stream 的可选参数版本。
 func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
+	return streamOptsObs(w, r, onErr, nil)
+}
+
+func streamOptsObs(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), obs EventObserver) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -406,6 +490,9 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 			return err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
+			if obs != nil {
+				obs(ev)
+			}
 			switch ev.Event {
 			case "output":
 				delta := map[string]any{}
